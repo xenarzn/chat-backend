@@ -16,26 +16,23 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
-// CONNECT MONGODB (WAJIB ADA MONGO_URI DI RENDER ENV)
-mongoose.connect(process.env.MONGO_URI)
-.then(() => console.log("MongoDB Connected"))
-.catch(err => console.log("Mongo Error:", err));
+mongoose.connect(process.env.MONGO_URI);
 
-// USER SCHEMA
+// USER SCHEMA (DITAMBAH PROFILE PICTURE)
 const UserSchema = new mongoose.Schema({
   username: { type: String, unique: true },
-  password: String
+  password: String,
+  profilePicture: { type: String, default: "" }
 });
 
-// MESSAGE SCHEMA (ditambah status & readAt untuk centang)
 const MessageSchema = new mongoose.Schema({
   sender: String,
   receiver: String,
   message: String,
-  status: { type: String, default: "sent" }, // sent | read
-  readAt: { type: Date, default: null },
+  read: { type: Boolean, default: false },
+  readAt: Date,
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -46,43 +43,63 @@ const Message = mongoose.model("Message", MessageSchema);
 app.post("/register", async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (!username || !password) {
-      return res.json({ success: false, message: "Invalid input" });
-    }
-
     const hash = await bcrypt.hash(password, 10);
     const user = new User({ username, password: hash });
     await user.save();
-
     res.json({ success: true });
-  } catch (err) {
+  } catch {
     res.json({ success: false, message: "Username already used" });
   }
 });
 
-// LOGIN
+// LOGIN + KIRIM PP USER
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
-
   const user = await User.findOne({ username });
   if (!user) return res.json({ success: false });
 
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) return res.json({ success: false });
 
+  res.json({
+    success: true,
+    profilePicture: user.profilePicture || ""
+  });
+});
+
+// UPLOAD / UPDATE PROFILE PICTURE
+app.post("/upload-pp", async (req, res) => {
+  const { username, image } = req.body;
+  if (!username || !image) {
+    return res.json({ success: false });
+  }
+
+  await User.updateOne(
+    { username },
+    { profilePicture: image }
+  );
+
   res.json({ success: true });
 });
 
-// SEARCH USERNAME
+// GET USER PP
+app.get("/user/:username", async (req, res) => {
+  const user = await User.findOne(
+    { username: req.params.username },
+    "username profilePicture"
+  );
+  res.json(user);
+});
+
+// SEARCH USER + PP
 app.get("/search/:username", async (req, res) => {
   const users = await User.find({
     username: { $regex: req.params.username, $options: "i" }
-  }).select("username");
-
+  }).select("username profilePicture");
   res.json(users);
 });
 
-// GET DM MESSAGES (HISTORY CHAT)
+// GET MESSAGES (DENGAN STATUS READ)
 app.get("/messages/:user1/:user2", async (req, res) => {
   const msgs = await Message.find({
     $or: [
@@ -94,87 +111,62 @@ app.get("/messages/:user1/:user2", async (req, res) => {
   res.json(msgs);
 });
 
-// SOCKET.IO (FIX UTAMA AGAR DM TERKIRIM)
+// SOCKET REALTIME DM FIX
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
 
-  // JOIN ROOM BERDASARKAN USERNAME (WAJIB)
+  // JOIN ROOM = USERNAME
   socket.on("join", (username) => {
-    if (!username) return;
     socket.join(username);
-    console.log("Joined room:", username);
   });
 
-  // KIRIM PESAN DM
+  // SEND MESSAGE (DENGAN PP)
   socket.on("send_message", async (data) => {
-    try {
-      const { sender, receiver, message } = data;
-      if (!sender || !receiver || !message) return;
+    const { sender, receiver, message } = data;
 
-      // Simpan ke database
-      const newMessage = new Message({
-        sender,
-        receiver,
-        message,
-        status: "sent"
-      });
+    const senderUser = await User.findOne({ username: sender });
 
-      await newMessage.save();
+    const newMsg = new Message({
+      sender,
+      receiver,
+      message
+    });
 
-      // Kirim ke penerima (PRIVATE DM)
-      io.to(receiver).emit("receive_message", {
-        _id: newMessage._id,
-        sender,
-        receiver,
-        message,
-        status: "sent",
-        createdAt: newMessage.createdAt
-      });
+    await newMsg.save();
 
-      // Kirim juga ke pengirim (agar bubble langsung muncul)
-      io.to(sender).emit("receive_message", {
-        _id: newMessage._id,
-        sender,
-        receiver,
-        message,
-        status: "sent",
-        createdAt: newMessage.createdAt
-      });
+    const payload = {
+      _id: newMsg._id,
+      sender,
+      receiver,
+      message,
+      createdAt: newMsg.createdAt,
+      senderPP: senderUser?.profilePicture || ""
+    };
 
-    } catch (err) {
-      console.log("Send message error:", err);
-    }
+    // KIRIM KE PENERIMA SAJA (DM REAL)
+    io.to(receiver).emit("receive_message", payload);
+    io.to(sender).emit("receive_message", payload);
   });
 
-  // READ RECEIPT (centang hijau + waktu GMT+7 nanti di frontend)
+  // READ MESSAGE + TIMESTAMP WIB SUPPORT
   socket.on("read_message", async (messageId) => {
-    try {
-      const msg = await Message.findByIdAndUpdate(
-        messageId,
-        { status: "read", readAt: new Date() },
-        { new: true }
-      );
+    const msg = await Message.findByIdAndUpdate(
+      messageId,
+      {
+        read: true,
+        readAt: new Date()
+      },
+      { new: true }
+    );
 
-      if (!msg) return;
+    if (!msg) return;
 
-      // Update ke pengirim bahwa pesan sudah dibaca
-      io.to(msg.sender).emit("message_read", {
-        _id: msg._id,
-        status: "read",
-        readAt: msg.readAt
-      });
-
-    } catch (err) {
-      console.log("Read error:", err);
-    }
-  });
-
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+    io.to(msg.sender).emit("message_read", {
+      _id: msg._id,
+      readAt: msg.readAt
+    });
   });
 });
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+server.listen(5000, () => {
+  console.log("Server running");
 });
