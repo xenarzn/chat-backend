@@ -16,7 +16,7 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "50mb" }));
 
 mongoose.connect(process.env.MONGO_URI);
 
@@ -27,9 +27,11 @@ const UserSchema = new mongoose.Schema({
   profilePicture: { type: String, default: "" }
 });
 
+// MESSAGE SCHEMA (SIAP AUDIO + TEXT)
 const MessageSchema = new mongoose.Schema({
   sender: String,
   receiver: String,
+  type: { type: String, default: "text" }, // text | audio
   message: String,
   read: { type: Boolean, default: false },
   readAt: Date,
@@ -39,6 +41,11 @@ const MessageSchema = new mongoose.Schema({
 const User = mongoose.model("User", UserSchema);
 const Message = mongoose.model("Message", MessageSchema);
 
+// HELPER DEFAULT AVATAR
+function defaultAvatar(username){
+  return `https://ui-avatars.com/api/?name=${username}&background=2563eb&color=fff&size=128`;
+}
+
 // REGISTER
 app.post("/register", async (req, res) => {
   try {
@@ -47,12 +54,12 @@ app.post("/register", async (req, res) => {
     const user = new User({ username, password: hash });
     await user.save();
     res.json({ success: true });
-  } catch {
+  } catch (err) {
     res.json({ success: false, message: "Username already used" });
   }
 });
 
-// LOGIN + KIRIM PP
+// LOGIN + PP
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   const user = await User.findOne({ username });
@@ -63,11 +70,11 @@ app.post("/login", async (req, res) => {
 
   res.json({
     success: true,
-    profilePicture: user.profilePicture || ""
+    profilePicture: user.profilePicture || defaultAvatar(username)
   });
 });
 
-// UPLOAD / UPDATE PP (GLOBAL SYNC)
+// UPLOAD PP (SYNC GLOBAL)
 app.post("/upload-pp", async (req, res) => {
   const { username, image } = req.body;
   if (!username || !image) {
@@ -79,7 +86,6 @@ app.post("/upload-pp", async (req, res) => {
     { profilePicture: image }
   );
 
-  // BROADCAST UPDATE PP KE SEMUA CLIENT YANG ONLINE
   io.emit("pp_updated", {
     username,
     profilePicture: image
@@ -88,25 +94,36 @@ app.post("/upload-pp", async (req, res) => {
   res.json({ success: true });
 });
 
-// GET USER (DENGAN PP)
+// GET USER + PP
 app.get("/user/:username", async (req, res) => {
   const user = await User.findOne(
     { username: req.params.username },
     "username profilePicture"
   );
-  res.json(user);
+
+  if (!user) return res.json(null);
+
+  res.json({
+    username: user.username,
+    profilePicture: user.profilePicture || defaultAvatar(user.username)
+  });
 });
 
-// SEARCH USER + PP
+// SEARCH USER + PP (FIX: PP TIDAK KOSONG)
 app.get("/search/:username", async (req, res) => {
   const users = await User.find({
     username: { $regex: req.params.username, $options: "i" }
   }).select("username profilePicture");
 
-  res.json(users);
+  const result = users.map(u => ({
+    username: u.username,
+    profilePicture: u.profilePicture || defaultAvatar(u.username)
+  }));
+
+  res.json(result);
 });
 
-// GET MESSAGES + AUTO INJECT SENDER PP (INI YANG PALING PENTING)
+// GET HISTORY + PP FULL FIX (INI YANG PALING PENTING)
 app.get("/messages/:user1/:user2", async (req, res) => {
   const { user1, user2 } = req.params;
 
@@ -117,27 +134,36 @@ app.get("/messages/:user1/:user2", async (req, res) => {
     ]
   }).sort({ createdAt: 1 });
 
-  // AMBIL SEMUA USER YANG TERLIBAT
-  const usernames = [...new Set(msgs.map(m => m.sender))];
+  // AMBIL SEMUA USER TERLIBAT (SENDER + RECEIVER)
+  const usernames = [
+    ...new Set(
+      msgs.flatMap(m => [m.sender, m.receiver])
+    )
+  ];
+
   const users = await User.find({
     username: { $in: usernames }
-  });
+  }).select("username profilePicture");
 
   const userMap = {};
   users.forEach(u => {
-    userMap[u.username] = u.profilePicture || "";
+    userMap[u.username] =
+      u.profilePicture && u.profilePicture !== ""
+        ? u.profilePicture
+        : defaultAvatar(u.username);
   });
 
-  // INJECT PP KE SETIAP MESSAGE
+  // INJECT PP KE SETIAP PESAN (STABIL)
   const messagesWithPP = msgs.map(m => ({
     _id: m._id,
     sender: m.sender,
     receiver: m.receiver,
+    type: m.type || "text",
     message: m.message,
     read: m.read,
     readAt: m.readAt,
     createdAt: m.createdAt,
-    senderPP: userMap[m.sender] || ""
+    senderPP: userMap[m.sender] || defaultAvatar(m.sender)
   }));
 
   res.json(messagesWithPP);
@@ -146,38 +172,50 @@ app.get("/messages/:user1/:user2", async (req, res) => {
 // SOCKET REALTIME
 io.on("connection", (socket) => {
 
+  // JOIN ROOM BERDASARKAN USERNAME
   socket.on("join", (username) => {
     socket.join(username);
   });
 
-  // SEND MESSAGE + PP REALTIME
+  // SEND MESSAGE + PP REALTIME FIX
   socket.on("send_message", async (data) => {
-    const { sender, receiver, message } = data;
+    const { sender, receiver, message, type } = data;
+
+    if (!sender || !receiver || !message) return;
 
     const senderUser = await User.findOne({ username: sender });
 
     const newMsg = new Message({
       sender,
       receiver,
-      message
+      message,
+      type: type || "text"
     });
 
     await newMsg.save();
+
+    const senderPP =
+      senderUser?.profilePicture && senderUser.profilePicture !== ""
+        ? senderUser.profilePicture
+        : defaultAvatar(sender);
 
     const payload = {
       _id: newMsg._id,
       sender,
       receiver,
       message,
+      type: newMsg.type,
       createdAt: newMsg.createdAt,
-      senderPP: senderUser?.profilePicture || ""
+      read: false,
+      senderPP: senderPP
     };
 
+    // DM REAL (TIDAK BROADCAST GLOBAL)
     io.to(receiver).emit("receive_message", payload);
     io.to(sender).emit("receive_message", payload);
   });
 
-  // READ MESSAGE
+  // READ MESSAGE + TIMESTAMP
   socket.on("read_message", async (messageId) => {
     const msg = await Message.findByIdAndUpdate(
       messageId,
@@ -198,5 +236,5 @@ io.on("connection", (socket) => {
 });
 
 server.listen(5000, () => {
-  console.log("Server running with PP sync + history fix");
+  console.log("Server running - PP sync FIXED + History + Realtime OK");
 });
