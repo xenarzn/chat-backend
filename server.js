@@ -16,11 +16,11 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 mongoose.connect(process.env.MONGO_URI);
 
-// USER SCHEMA (DITAMBAH PROFILE PICTURE)
+// USER SCHEMA
 const UserSchema = new mongoose.Schema({
   username: { type: String, unique: true },
   password: String,
@@ -52,7 +52,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// LOGIN + KIRIM PP USER
+// LOGIN + KIRIM PP
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   const user = await User.findOne({ username });
@@ -67,7 +67,7 @@ app.post("/login", async (req, res) => {
   });
 });
 
-// UPLOAD / UPDATE PROFILE PICTURE
+// UPLOAD / UPDATE PP (GLOBAL SYNC)
 app.post("/upload-pp", async (req, res) => {
   const { username, image } = req.body;
   if (!username || !image) {
@@ -79,10 +79,16 @@ app.post("/upload-pp", async (req, res) => {
     { profilePicture: image }
   );
 
+  // BROADCAST UPDATE PP KE SEMUA CLIENT YANG ONLINE
+  io.emit("pp_updated", {
+    username,
+    profilePicture: image
+  });
+
   res.json({ success: true });
 });
 
-// GET USER PP
+// GET USER (DENGAN PP)
 app.get("/user/:username", async (req, res) => {
   const user = await User.findOne(
     { username: req.params.username },
@@ -96,30 +102,55 @@ app.get("/search/:username", async (req, res) => {
   const users = await User.find({
     username: { $regex: req.params.username, $options: "i" }
   }).select("username profilePicture");
+
   res.json(users);
 });
 
-// GET MESSAGES (DENGAN STATUS READ)
+// GET MESSAGES + AUTO INJECT SENDER PP (INI YANG PALING PENTING)
 app.get("/messages/:user1/:user2", async (req, res) => {
+  const { user1, user2 } = req.params;
+
   const msgs = await Message.find({
     $or: [
-      { sender: req.params.user1, receiver: req.params.user2 },
-      { sender: req.params.user2, receiver: req.params.user1 }
+      { sender: user1, receiver: user2 },
+      { sender: user2, receiver: user1 }
     ]
   }).sort({ createdAt: 1 });
 
-  res.json(msgs);
+  // AMBIL SEMUA USER YANG TERLIBAT
+  const usernames = [...new Set(msgs.map(m => m.sender))];
+  const users = await User.find({
+    username: { $in: usernames }
+  });
+
+  const userMap = {};
+  users.forEach(u => {
+    userMap[u.username] = u.profilePicture || "";
+  });
+
+  // INJECT PP KE SETIAP MESSAGE
+  const messagesWithPP = msgs.map(m => ({
+    _id: m._id,
+    sender: m.sender,
+    receiver: m.receiver,
+    message: m.message,
+    read: m.read,
+    readAt: m.readAt,
+    createdAt: m.createdAt,
+    senderPP: userMap[m.sender] || ""
+  }));
+
+  res.json(messagesWithPP);
 });
 
-// SOCKET REALTIME DM FIX
+// SOCKET REALTIME
 io.on("connection", (socket) => {
 
-  // JOIN ROOM = USERNAME
   socket.on("join", (username) => {
     socket.join(username);
   });
 
-  // SEND MESSAGE (DENGAN PP)
+  // SEND MESSAGE + PP REALTIME
   socket.on("send_message", async (data) => {
     const { sender, receiver, message } = data;
 
@@ -142,12 +173,11 @@ io.on("connection", (socket) => {
       senderPP: senderUser?.profilePicture || ""
     };
 
-    // KIRIM KE PENERIMA SAJA (DM REAL)
     io.to(receiver).emit("receive_message", payload);
     io.to(sender).emit("receive_message", payload);
   });
 
-  // READ MESSAGE + TIMESTAMP WIB SUPPORT
+  // READ MESSAGE
   socket.on("read_message", async (messageId) => {
     const msg = await Message.findByIdAndUpdate(
       messageId,
@@ -168,5 +198,5 @@ io.on("connection", (socket) => {
 });
 
 server.listen(5000, () => {
-  console.log("Server running");
+  console.log("Server running with PP sync + history fix");
 });
