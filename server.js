@@ -16,7 +16,9 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json({ limit: "100mb" })); // dinaikkan untuk audio base64
+// Limit ditingkatkan ke 100mb untuk menangani upload gambar & audio base64
+app.use(express.json({ limit: "100mb" })); 
+app.use(express.urlencoded({ limit: "100mb", extended: true }));
 
 mongoose.connect(process.env.MONGO_URI);
 
@@ -27,12 +29,12 @@ const UserSchema = new mongoose.Schema({
   profilePicture: { type: String, default: "" }
 });
 
-// MESSAGE SCHEMA (SUPPORT TEXT + AUDIO/VN)
+// MESSAGE SCHEMA
 const MessageSchema = new mongoose.Schema({
   sender: String,
   receiver: String,
-  type: { type: String, default: "text" }, // text | audio
-  message: String, // text atau base64 audio
+  type: { type: String, default: "text" }, 
+  message: String, 
   read: { type: Boolean, default: false },
   readAt: Date,
   createdAt: { type: Date, default: Date.now }
@@ -59,7 +61,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
-// LOGIN + PP
+// LOGIN
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   const user = await User.findOne({ username });
@@ -74,59 +76,44 @@ app.post("/login", async (req, res) => {
   });
 });
 
-// UPLOAD PP (SYNC GLOBAL)
-app.post("/upload-pp", async (req, res) => {
-  const { username, image } = req.body;
-  if (!username || !image) {
-    return res.json({ success: false });
+// --- UPDATE/UPLOAD PP (Sinkron dengan UI) ---
+app.post("/update-pp", async (req, res) => {
+  try {
+    const { username, profilePicture } = req.body; // Menggunakan nama sesuai UI
+    if (!username || !profilePicture) {
+      return res.status(400).json({ success: false, message: "Data tidak lengkap" });
+    }
+
+    await User.updateOne(
+      { username },
+      { profilePicture: profilePicture }
+    );
+
+    // Kirim sinyal ke semua orang bahwa user ini ganti foto
+    io.emit("pp_updated", {
+      username,
+      profilePicture: profilePicture
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
-
-  await User.updateOne(
-    { username },
-    { profilePicture: image }
-  );
-
-  io.emit("pp_updated", {
-    username,
-    profilePicture: image
-  });
-
-  res.json({ success: true });
 });
 
-// GET USER + PP
+// GET USER
 app.get("/user/:username", async (req, res) => {
-  const user = await User.findOne(
-    { username: req.params.username },
-    "username profilePicture"
-  );
-
+  const user = await User.findOne({ username: req.params.username });
   if (!user) return res.json(null);
-
   res.json({
     username: user.username,
     profilePicture: user.profilePicture || defaultAvatar(user.username)
   });
 });
 
-// SEARCH USER + PP
-app.get("/search/:username", async (req, res) => {
-  const users = await User.find({
-    username: { $regex: req.params.username, $options: "i" }
-  }).select("username profilePicture");
-
-  const result = users.map(u => ({
-    username: u.username,
-    profilePicture: u.profilePicture || defaultAvatar(u.username)
-  }));
-
-  res.json(result);
-});
-
-// GET HISTORY (TEXT + VN + PP)
+// GET HISTORY
 app.get("/messages/:user1/:user2", async (req, res) => {
   const { user1, user2 } = req.params;
-
   const msgs = await Message.find({
     $or: [
       { sender: user1, receiver: user2 },
@@ -134,34 +121,24 @@ app.get("/messages/:user1/:user2", async (req, res) => {
     ]
   }).sort({ createdAt: 1 });
 
-  const usernames = [
-    ...new Set(
-      msgs.flatMap(m => [m.sender, m.receiver])
-    )
-  ];
-
-  const users = await User.find({
-    username: { $in: usernames }
-  }).select("username profilePicture");
+  const usernames = [...new Set(msgs.flatMap(m => [m.sender, m.receiver]))];
+  const users = await User.find({ username: { $in: usernames } });
 
   const userMap = {};
   users.forEach(u => {
-    userMap[u.username] =
-      u.profilePicture && u.profilePicture !== ""
-        ? u.profilePicture
-        : defaultAvatar(u.username);
+    userMap[u.username] = u.profilePicture || defaultAvatar(u.username);
   });
 
   const messagesWithPP = msgs.map(m => ({
     _id: m._id,
     sender: m.sender,
     receiver: m.receiver,
-    type: m.type || "text",
+    type: m.type,
     message: m.message,
     read: m.read,
     readAt: m.readAt,
     createdAt: m.createdAt,
-    senderPP: userMap[m.sender] || defaultAvatar(m.sender)
+    senderPP: userMap[m.sender]
   }));
 
   res.json(messagesWithPP);
@@ -169,32 +146,23 @@ app.get("/messages/:user1/:user2", async (req, res) => {
 
 // SOCKET REALTIME
 io.on("connection", (socket) => {
-
   socket.on("join", (username) => {
     socket.join(username);
   });
 
-  // SEND TEXT ATAU VOICE NOTE
   socket.on("send_message", async (data) => {
     const { sender, receiver, message, type } = data;
-
     if (!sender || !receiver || !message) return;
 
     const senderUser = await User.findOne({ username: sender });
-
     const newMsg = new Message({
       sender,
       receiver,
       message,
-      type: type || "text" // "text" atau "audio"
+      type: type || "text"
     });
 
     await newMsg.save();
-
-    const senderPP =
-      senderUser?.profilePicture && senderUser.profilePicture !== ""
-        ? senderUser.profilePicture
-        : defaultAvatar(sender);
 
     const payload = {
       _id: newMsg._id,
@@ -204,34 +172,23 @@ io.on("connection", (socket) => {
       type: newMsg.type,
       createdAt: newMsg.createdAt,
       read: false,
-      senderPP: senderPP
+      senderPP: senderUser?.profilePicture || defaultAvatar(sender)
     };
 
-    // KIRIM DM REALTIME
     io.to(receiver).emit("receive_message", payload);
     io.to(sender).emit("receive_message", payload);
   });
 
-  // READ MESSAGE
   socket.on("read_message", async (messageId) => {
-    const msg = await Message.findByIdAndUpdate(
-      messageId,
-      {
-        read: true,
-        readAt: new Date()
-      },
-      { new: true }
-    );
-
-    if (!msg) return;
-
-    io.to(msg.sender).emit("message_read", {
-      _id: msg._id,
-      readAt: msg.readAt
-    });
+    const msg = await Message.findByIdAndUpdate(messageId, { read: true, readAt: new Date() }, { new: true });
+    if (msg) {
+      io.to(msg.sender).emit("message_read", { _id: msg._id, readAt: msg.readAt });
+    }
   });
 });
 
-server.listen(5000, () => {
-  console.log("Server running with VN + PP + History + Realtime");
+// Gunakan port dari environment (Render) atau 5000
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
 });
