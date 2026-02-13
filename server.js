@@ -76,6 +76,18 @@ io.on("connection", (socket) => {
     io.to(sender).emit("message_read", { messageId });
   });
 
+  socket.on("edit_message", async ({ messageId, newMessage, receiver }) => {
+    await Message.findByIdAndUpdate(messageId, { message: newMessage });
+    io.to(uName).emit("message_edited", { messageId, newMessage });
+    io.to(receiver).emit("message_edited", { messageId, newMessage });
+  });
+
+  socket.on("delete_message", async ({ messageId, receiver }) => {
+    await Message.findByIdAndDelete(messageId);
+    io.to(uName).emit("message_deleted", messageId);
+    io.to(receiver).emit("message_deleted", messageId);
+  });
+
   socket.on("typing", (data) => io.to(data.receiver).emit("display_typing", data));
 
   socket.on("disconnect", async () => {
