@@ -16,7 +16,7 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "100mb" })); // dinaikkan untuk audio base64
 
 mongoose.connect(process.env.MONGO_URI);
 
@@ -27,12 +27,12 @@ const UserSchema = new mongoose.Schema({
   profilePicture: { type: String, default: "" }
 });
 
-// MESSAGE SCHEMA (SIAP AUDIO + TEXT)
+// MESSAGE SCHEMA (SUPPORT TEXT + AUDIO/VN)
 const MessageSchema = new mongoose.Schema({
   sender: String,
   receiver: String,
   type: { type: String, default: "text" }, // text | audio
-  message: String,
+  message: String, // text atau base64 audio
   read: { type: Boolean, default: false },
   readAt: Date,
   createdAt: { type: Date, default: Date.now }
@@ -41,7 +41,7 @@ const MessageSchema = new mongoose.Schema({
 const User = mongoose.model("User", UserSchema);
 const Message = mongoose.model("Message", MessageSchema);
 
-// HELPER DEFAULT AVATAR
+// DEFAULT AVATAR
 function defaultAvatar(username){
   return `https://ui-avatars.com/api/?name=${username}&background=2563eb&color=fff&size=128`;
 }
@@ -54,7 +54,7 @@ app.post("/register", async (req, res) => {
     const user = new User({ username, password: hash });
     await user.save();
     res.json({ success: true });
-  } catch (err) {
+  } catch {
     res.json({ success: false, message: "Username already used" });
   }
 });
@@ -109,7 +109,7 @@ app.get("/user/:username", async (req, res) => {
   });
 });
 
-// SEARCH USER + PP (FIX: PP TIDAK KOSONG)
+// SEARCH USER + PP
 app.get("/search/:username", async (req, res) => {
   const users = await User.find({
     username: { $regex: req.params.username, $options: "i" }
@@ -123,7 +123,7 @@ app.get("/search/:username", async (req, res) => {
   res.json(result);
 });
 
-// GET HISTORY + PP FULL FIX (INI YANG PALING PENTING)
+// GET HISTORY (TEXT + VN + PP)
 app.get("/messages/:user1/:user2", async (req, res) => {
   const { user1, user2 } = req.params;
 
@@ -134,7 +134,6 @@ app.get("/messages/:user1/:user2", async (req, res) => {
     ]
   }).sort({ createdAt: 1 });
 
-  // AMBIL SEMUA USER TERLIBAT (SENDER + RECEIVER)
   const usernames = [
     ...new Set(
       msgs.flatMap(m => [m.sender, m.receiver])
@@ -153,7 +152,6 @@ app.get("/messages/:user1/:user2", async (req, res) => {
         : defaultAvatar(u.username);
   });
 
-  // INJECT PP KE SETIAP PESAN (STABIL)
   const messagesWithPP = msgs.map(m => ({
     _id: m._id,
     sender: m.sender,
@@ -172,12 +170,11 @@ app.get("/messages/:user1/:user2", async (req, res) => {
 // SOCKET REALTIME
 io.on("connection", (socket) => {
 
-  // JOIN ROOM BERDASARKAN USERNAME
   socket.on("join", (username) => {
     socket.join(username);
   });
 
-  // SEND MESSAGE + PP REALTIME FIX
+  // SEND TEXT ATAU VOICE NOTE
   socket.on("send_message", async (data) => {
     const { sender, receiver, message, type } = data;
 
@@ -189,7 +186,7 @@ io.on("connection", (socket) => {
       sender,
       receiver,
       message,
-      type: type || "text"
+      type: type || "text" // "text" atau "audio"
     });
 
     await newMsg.save();
@@ -210,12 +207,12 @@ io.on("connection", (socket) => {
       senderPP: senderPP
     };
 
-    // DM REAL (TIDAK BROADCAST GLOBAL)
+    // KIRIM DM REALTIME
     io.to(receiver).emit("receive_message", payload);
     io.to(sender).emit("receive_message", payload);
   });
 
-  // READ MESSAGE + TIMESTAMP
+  // READ MESSAGE
   socket.on("read_message", async (messageId) => {
     const msg = await Message.findByIdAndUpdate(
       messageId,
@@ -236,5 +233,5 @@ io.on("connection", (socket) => {
 });
 
 server.listen(5000, () => {
-  console.log("Server running - PP sync FIXED + History + Realtime OK");
+  console.log("Server running with VN + PP + History + Realtime");
 });
